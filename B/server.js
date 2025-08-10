@@ -12,31 +12,10 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // Middleware
-const allowedOrigin = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/+$/, '');
+app.use(cors());
+app.use(express.json());
 
-app.use(cors({
-  origin: allowedOrigin,
-  methods: ['GET','POST','OPTIONS'],
-  credentials: true
-}));
-
-// Handle preflight globally - FIXED: More specific preflight handling
-app.options('/api/*', cors());
-
-app.use(express.json({ limit: '10mb' })); // Added limit for safety
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-
-// Initialize AI with error handling
-let ai;
-try {
-  ai = new GoogleGenAI({
-    apiKey: process.env.GEMINI_API_KEY // Explicitly pass API key
-  });
-} catch (error) {
-  console.error('Failed to initialize Google GenAI:', error);
-  process.exit(1);
-}
-
+const ai = new GoogleGenAI({});
 const conversationHistory = new Map(); // Store conversations by sessionId
 
 async function transformQuery(question, history) {
@@ -47,17 +26,15 @@ async function transformQuery(question, history) {
 
     try {
         const response = await ai.models.generateContent({
-            model: "gemini-2.0-flash-exp", // Updated to more stable model
+            model: "gemini-2.0-flash",
             contents: tempHistory,
             config: {
                 systemInstruction: `You are a query rewriting expert. Based on the provided chat history, 
                 rephrase the "Follow Up user Question" into a complete, standalone question that can be 
                 understood without the chat history. Only output the rewritten question and nothing else.`,
-                temperature: 0.3, // Lower temperature for consistency
-                maxOutputTokens: 200 // Limit output for query transformation
             },
         });
-        return response.text?.trim() || question;
+        return response.text;
     } catch (error) {
         console.error('Error in transformQuery:', error);
         return question; // Return original question if transformation fails
@@ -66,15 +43,6 @@ async function transformQuery(question, history) {
 
 async function processQuery(question, sessionId) {
     try {
-        // Validate inputs
-        if (!question || typeof question !== 'string') {
-            throw new Error('Invalid question provided');
-        }
-        
-        if (!sessionId || typeof sessionId !== 'string') {
-            sessionId = 'default';
-        }
-
         // Get or create conversation history for this session
         if (!conversationHistory.has(sessionId)) {
             conversationHistory.set(sessionId, []);
@@ -84,31 +52,16 @@ async function processQuery(question, sessionId) {
         // Step 1: Transform the query based on conversation history
         const transformedQuery = await transformQuery(question, history);
 
-        // Step 2: Convert the query into embedding with error handling
-        let embeddings;
-        try {
-            embeddings = new GoogleGenerativeAIEmbeddings({
-                apiKey: process.env.GEMINI_API_KEY,
-                model: 'text-embedding-004',
-            });
-        } catch (error) {
-            console.error('Failed to initialize embeddings:', error);
-            throw new Error('Embedding service unavailable');
-        }
-
+        // Step 2: Convert the query into embedding
+        const embeddings = new GoogleGenerativeAIEmbeddings({
+            apiKey: process.env.GEMINI_API_KEY,
+            model: 'text-embedding-004',
+        });
         const queryVector = await embeddings.embedQuery(transformedQuery);
 
-        // Step 3: Connect with Pinecone and search with error handling
-        let pinecone, pineconeIndex;
-        try {
-            pinecone = new Pinecone({
-                apiKey: process.env.PINECONE_API_KEY
-            });
-            pineconeIndex = pinecone.Index(process.env.PINECONE_INDEX_NAME);
-        } catch (error) {
-            console.error('Failed to initialize Pinecone:', error);
-            throw new Error('Vector database unavailable');
-        }
+        // Step 3: Connect with Pinecone and search
+        const pinecone = new Pinecone();
+        const pineconeIndex = pinecone.Index(process.env.PINECONE_INDEX_NAME);
 
         const searchResults = await pineconeIndex.query({
             topK: 10,
@@ -118,17 +71,8 @@ async function processQuery(question, sessionId) {
 
         // Step 4: Extract context from search results
         const context = searchResults.matches
-            ?.map(match => match.metadata?.text || '')
-            .filter(text => text.length > 0)
-            .join("\n\n---\n\n") || '';
-
-        if (!context) {
-            return {
-                success: true,
-                response: "I could not find relevant information in the provided document.",
-                transformedQuery: transformedQuery
-            };
-        }
+            .map(match => match.metadata.text)
+            .join("\n\n---\n\n");
 
         // Step 5: Add user question to history
         history.push({
@@ -138,7 +82,7 @@ async function processQuery(question, sessionId) {
 
         // Step 6: Generate response using the LLM
         const response = await ai.models.generateContent({
-            model: "gemini-2.0-flash-exp", // Updated to more stable model
+            model: "gemini-2.0-flash",
             contents: history,
             config: {
                 systemInstruction: `You are a Microsoft Power BI Expert.
@@ -150,8 +94,6 @@ async function processQuery(question, sessionId) {
             
                 Context: ${context}
                 `,
-                temperature: 0.7,
-                maxOutputTokens: 2048
             },
         });
 
@@ -161,12 +103,8 @@ async function processQuery(question, sessionId) {
             parts: [{ text: response.text }]
         });
 
-        // Limit history to prevent memory issues (keep last 10 exchanges)
-        if (history.length > 20) {
-            conversationHistory.set(sessionId, history.slice(-20));
-        } else {
-            conversationHistory.set(sessionId, history);
-        }
+        // Update conversation history
+        conversationHistory.set(sessionId, history);
 
         return {
             success: true,
@@ -183,28 +121,19 @@ async function processQuery(question, sessionId) {
     }
 }
 
-// Error handling middleware
-app.use((err, req, res, next) => {
-    console.error('Unhandled error:', err);
-    res.status(500).json({
-        success: false,
-        error: 'Internal server error'
-    });
-});
-
-// Routes - FIXED: More explicit route definitions
+// Routes
 app.post('/api/chat', async (req, res) => {
     try {
         const { question, sessionId = 'default' } = req.body;
 
-        if (!question || typeof question !== 'string' || question.trim().length === 0) {
+        if (!question) {
             return res.status(400).json({
                 success: false,
-                error: 'Question is required and must be a non-empty string'
+                error: 'Question is required'
             });
         }
 
-        const result = await processQuery(question.trim(), sessionId);
+        const result = await processQuery(question, sessionId);
         res.json(result);
 
     } catch (error) {
@@ -223,43 +152,18 @@ app.post('/api/clear-history', (req, res) => {
         conversationHistory.delete(sessionId);
         res.json({ success: true, message: 'History cleared successfully' });
     } catch (error) {
-        console.error('Error clearing history:', error);
         res.status(500).json({ success: false, error: 'Failed to clear history' });
     }
 });
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
-    res.json({ 
-        status: 'OK', 
-        message: 'PowerBI RAG Server is running',
-        timestamp: new Date().toISOString()
-    });
+    res.json({ status: 'OK', message: 'PowerBI RAG Server is running' });
 });
 
-// Catch-all for undefined routes
-app.use('*', (req, res) => {
-    res.status(404).json({
-        success: false,
-        error: 'Route not found'
-    });
-});
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-    console.log('Received SIGTERM, shutting down gracefully');
-    process.exit(0);
-});
-
-process.on('SIGINT', () => {
-    console.log('Received SIGINT, shutting down gracefully');
-    process.exit(0);
-});
-
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, () => {
     console.log(`🚀 PowerBI RAG Server running on port ${PORT}`);
     console.log(`📖 Health check: http://localhost:${PORT}/api/health`);
-    console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
 export default app;
