@@ -8,7 +8,8 @@ const App = () => {
   const [sessionId] = useState(() => 'session-' + Math.random().toString(36).substr(2, 9));
   const messagesEndRef = useRef(null);
 
-  const API_BASE_URL = 'http://localhost:5000/api';
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
